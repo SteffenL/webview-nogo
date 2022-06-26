@@ -120,17 +120,5 @@ cl %warning_params% ^
 	/std:c++17 /EHsc "/Fo%build_dir%"\ ^
 	"%src_dir%\webview_test.cc" /link "/OUT:%build_dir%\webview_test.exe" || exit \b
 
-echo Building Go examples
-mkdir build\examples\go
-set CGO_CPPFLAGS="-I%script_dir%\microsoft.web.webview2.%nuget_version%\build\native\include"
-set CGO_LDFLAGS="-L%script_dir%\microsoft.web.webview2.%nuget_version%\build\native\x64"
-go build -ldflags="-H windowsgui" -o build\examples\go\basic.exe examples\basic.go || exit /b
-go build -ldflags="-H windowsgui" -o build\examples\go\bind.exe examples\bind.go || exit /b
-
 echo Running tests
 "%build_dir%\webview_test.exe" || exit \b
-
-echo Running Go tests
-cd /D %src_dir%
-set CGO_ENABLED=1
-go test || exit \b
