@@ -836,9 +836,26 @@ using browser_engine = detail::cocoa_wkwebview_engine;
 #include <stdlib.h>
 #include <windows.h>
 
+// Selects whether to use embedded headers for the WebView2 library or external headers.
+// - Don't include embedded header if WEBVIEW_NO_EMBEDDED_WEBVIEW2 is defined.
+// - Include embedded header if it can be detected (convenience for MinGW-w64/GCC).
+// - Include embedded header if WEBVIEW_USE_EMBEDDED_WEBVIEW2 i defined.
+// - Include external header if embedded header has not been included.
+#if !defined(WEBVIEW_NO_EMBEDDED_WEBVIEW2)
+#if defined(__has_include)
+#if __has_include("libs/mswebview2/versions/auto.h")
+#include "libs/mswebview2/versions/auto.h"
+#endif
+#elif defined(WEBVIEW_USE_EMBEDDED_WEBVIEW2)
+#include "libs/mswebview2/versions/auto.h"
+#endif
+#endif
+#ifndef __webview2_h__
 #include "WebView2.h"
+#endif
 
 #ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -940,6 +957,8 @@ public:
   // Returns true if the library is currently loaded; otherwise false.
   bool is_loaded() const { return !!m_handle; }
 
+  void detach() { m_handle = nullptr; }
+
 private:
   HMODULE m_handle = nullptr;
 };
@@ -963,6 +982,67 @@ struct shcore_symbols {
       library_symbol<SetProcessDpiAwareness_t>("SetProcessDpiAwareness");
 };
 
+class reg_key {
+public:
+  explicit reg_key(HKEY root_key, const wchar_t *sub_key, DWORD options,
+                   REGSAM sam_desired) {
+    HKEY handle;
+    auto status =
+        RegOpenKeyExW(root_key, sub_key, options, sam_desired, &handle);
+    if (status == ERROR_SUCCESS) {
+      m_handle = handle;
+    }
+  }
+
+  explicit reg_key(HKEY root_key, const std::wstring &sub_key, DWORD options,
+                   REGSAM sam_desired)
+      : reg_key(root_key, sub_key.c_str(), options, sam_desired) {}
+
+  virtual ~reg_key() {
+    if (m_handle) {
+      RegCloseKey(m_handle);
+      m_handle = nullptr;
+    }
+  }
+
+  reg_key(const reg_key &other) = delete;
+  reg_key &operator=(const reg_key &other) = delete;
+  reg_key(reg_key &&other) = delete;
+  reg_key &operator=(reg_key &&other) = delete;
+
+  bool is_open() const { return !!m_handle; }
+  bool get_handle() const { return m_handle; }
+
+  std::wstring query_string(const wchar_t *name) const {
+    DWORD buf_length = 0;
+    // Get the size of the data in bytes.
+    auto status = RegQueryValueExW(m_handle, name, nullptr, nullptr, nullptr,
+                                   &buf_length);
+    if (status != ERROR_SUCCESS && status != ERROR_MORE_DATA) {
+      return std::wstring();
+    }
+    // Read the data.
+    std::wstring result(buf_length / sizeof(wchar_t), 0);
+    auto buf = reinterpret_cast<LPBYTE>(&result[0]);
+    status =
+        RegQueryValueExW(m_handle, name, nullptr, nullptr, buf, &buf_length);
+    if (status != ERROR_SUCCESS) {
+      return std::wstring();
+    }
+    // Remove trailing null-characters.
+    for (std::size_t length = result.size(); length > 0; --length) {
+      if (result[length - 1] != 0) {
+        result.resize(length);
+        break;
+      }
+    }
+    return result;
+  }
+
+private:
+  HKEY m_handle = nullptr;
+};
+
 bool enable_dpi_awareness() {
   auto user32 = native_library(L"user32.dll");
   if (auto fn = user32.get(user32_symbols::SetProcessDpiAwarenessContext)) {
@@ -982,6 +1062,106 @@ bool enable_dpi_awareness() {
   }
   return true;
 }
+
+namespace mswebview2 {
+static constexpr IID
+    IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler{
+        0x4E8A3389, 0xC9D8, 0x4BD2, 0xB6, 0xB5, 0x12,
+        0x4F,       0xEE,   0x6C,   0xC1, 0x4D};
+
+struct WebView2RunTimeType {
+  enum type { installed = 0 };
+};
+
+struct webview2_symbols {
+  using CreateCoreWebView2EnvironmentWithOptions_t =
+      HRESULT(STDMETHODCALLTYPE *)(
+          PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *,
+          ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
+  using CreateWebViewEnvironmentWithOptionsInternal_t =
+      HRESULT(STDMETHODCALLTYPE *)(
+          bool, WebView2RunTimeType::type, PCWSTR, IUnknown *,
+          ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
+  using DllCanUnloadNow_t = HRESULT(STDMETHODCALLTYPE *)();
+
+  static constexpr auto CreateCoreWebView2EnvironmentWithOptions =
+      webview::detail::library_symbol<
+          CreateCoreWebView2EnvironmentWithOptions_t>(
+          "CreateCoreWebView2EnvironmentWithOptions");
+  static constexpr auto CreateWebViewEnvironmentWithOptionsInternal =
+      webview::detail::library_symbol<
+          CreateWebViewEnvironmentWithOptionsInternal_t>(
+          "CreateWebViewEnvironmentWithOptionsInternal");
+  static constexpr auto DllCanUnloadNow =
+      webview::detail::library_symbol<DllCanUnloadNow_t>("DllCanUnloadNow");
+};
+
+std::wstring find_edge_webview_client_dll() {
+  std::wstring stable_release_guid = L"{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+  std::wstring sub_key =
+      L"SOFTWARE\\Microsoft\\EdgeUpdate\\ClientState\\" + stable_release_guid;
+  reg_key key(HKEY_LOCAL_MACHINE, sub_key, 0, KEY_READ | KEY_WOW64_32KEY);
+  if (!key.is_open()) {
+    return std::wstring();
+  }
+  auto client_dll_path = key.query_string(L"EBWebView");
+  client_dll_path += L"\\EBWebView\\";
+#if defined(_M_X64) || defined(_M_AMD64)
+  client_dll_path += L"x64";
+#elif defined(_M_X86)
+  client_dll_path += L"x86";
+#elif defined(_M_ARM64)
+  // TODO: Check if this is actually possible
+  client_dll_path += L"arm64";
+#endif
+  client_dll_path += L"\\EmbeddedBrowserWebView.dll";
+  return client_dll_path;
+}
+
+STDAPI create_environment_with_options_impl(
+    PCWSTR browserExecutableFolder, PCWSTR userDataFolder,
+    ICoreWebView2EnvironmentOptions *environmentOptions,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler
+        *environmentCreatedHandler) {
+  auto client_dll_path = find_edge_webview_client_dll();
+  if (client_dll_path.empty()) {
+    return -1;
+  }
+  auto client_dll = webview::detail::native_library(client_dll_path.c_str());
+  if (auto fn = client_dll.get(
+          webview2_symbols::CreateWebViewEnvironmentWithOptionsInternal)) {
+    auto rtt = WebView2RunTimeType::installed;
+    environmentCreatedHandler->AddRef();
+    return fn(true, rtt, userDataFolder, environmentOptions,
+              environmentCreatedHandler);
+  }
+  if (auto fn = client_dll.get(webview2_symbols::DllCanUnloadNow)) {
+    if (!fn()) {
+      client_dll.detach();
+    }
+  }
+  return ERROR_SUCCESS;
+}
+
+STDAPI create_environment_with_options(
+    PCWSTR browserExecutableFolder, PCWSTR userDataFolder,
+    ICoreWebView2EnvironmentOptions *environmentOptions,
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler
+        *environmentCreatedHandler) {
+  native_library loader_lib(L"WebView2Loader.dll");
+  if (loader_lib.is_loaded()) {
+    if (auto fn = loader_lib.get(
+            webview2_symbols::CreateCoreWebView2EnvironmentWithOptions)) {
+      return fn(browserExecutableFolder, userDataFolder, environmentOptions,
+                environmentCreatedHandler);
+    }
+  }
+  return create_environment_with_options_impl(
+      browserExecutableFolder, userDataFolder, environmentOptions,
+      environmentCreatedHandler);
+}
+
+} // namespace mswebview2
 
 class win32_edge_engine {
 public:
@@ -1171,7 +1351,7 @@ private:
           m_webview = webview;
           flag.clear();
         });
-    HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
+    HRESULT res = mswebview2::create_environment_with_options(
         nullptr, userDataFolder, nullptr, handler);
     if (res != S_OK) {
       return false;
@@ -1231,6 +1411,15 @@ private:
       return 0;
     }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv) {
+      if (!ppv) {
+        return E_POINTER;
+      }
+      auto other_iid = mswebview2::
+          IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler;
+      if (IsEqualIID(riid, other_iid)) {
+        *ppv = static_cast<
+            ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *>(this);
+      }
       return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT res,
